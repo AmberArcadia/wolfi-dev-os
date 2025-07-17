@@ -1,0 +1,83 @@
+name: Dependency Rebuild Check
+
+on:
+  pull_request:
+    paths:
+      - '*.yaml'
+  push:
+    branches:
+      - main
+    paths:
+      - '*.yaml'
+
+jobs:
+  check-dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # Need at least 2 commits to compare changes
+      - name: Install wolfictl
+        run: |
+          curl -sL https://github.com/wolfi-dev/wolfictl/releases/latest/download/wolfictl-linux-amd64.tar.gz | tar -xz
+          sudo mv wolfictl /usr/local/bin/
+      - name: Checkout additional repositories for cross-repo analysis
+        run: |
+          # Clone the other two repos needed for cross-repo dependency analysis
+          # Using --depth 1 for faster checkout since we only need the package definitions
+          git clone --depth 1 https://github.com/wolfi-dev/enterprise-packages.git ../enterprise-packages || {
+            echo "Warning: Could not clone enterprise-packages, skipping cross-repo analysis for that repo"
+            mkdir -p ../enterprise-packages
+          }
+          git clone --depth 1 https://github.com/wolfi-dev/extra-packages.git ../extra-packages || {
+            echo "Warning: Could not clone extra-packages, skipping cross-repo analysis for that repo"
+            mkdir -p ../extra-packages
+          }
+      - name: Check for dependency rebuilds needed
+        id: check
+        run: |
+          # Make the script executable
+          chmod +x ./dependency-rebuild-check.sh
+
+          # Set the repo base directory for CI environment
+          export REPO_BASE_DIR="$(dirname $(pwd))"
+
+          # Debug: Show what repos are available
+          echo "Available repositories:"
+          ls -la ../
+
+          # Run the dependency check and capture output
+          # The script will exit 0 if no rebuilds needed, or if rebuilds are found
+          # We want to capture both cases as success for the check step
+          ./dependency-rebuild-check.sh > dependency-commands.txt 2>&1 || true
+
+          # Check if rebuilds are needed
+          if grep -q "wolfictl bump" dependency-commands.txt; then
+            echo "rebuilds_needed=true" >> $GITHUB_OUTPUT
+            echo "Dependencies found that need rebuilding"
+          else
+            echo "rebuilds_needed=false" >> $GITHUB_OUTPUT
+            echo "No dependency rebuilds needed"
+          fi
+
+          # Always show the output
+          cat dependency-commands.txt
+      - name: Comment on PR with rebuild commands
+        if: github.event_name == 'pull_request' && steps.check.outputs.rebuilds_needed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: "const fs = require('fs');\n\n// Read the generated commands\nlet commands = '';\ntry {\n  commands = fs.readFileSync('dependency-commands.txt', 'utf8');\n} catch (error) {\n  console.log('No dependency commands file found');\n  return;\n}\n\n// Only comment if there are actual rebuild commands\nif (commands.includes('wolfictl bump')) {\n  const comment = [\n    '## \U0001F504 Dependency Rebuild Required',\n    '',\n    'This PR modifies packages that have downstream dependencies. The following packages need to be rebuilt:',\n    '',\n    '<details>',\n    '<summary>\U0001F4CB Generated Rebuild Commands</summary>',\n    '',\n    '```bash',\n    commands,\n    '```',\n    '',\n    '</details>',\n    '',\n    '### How to proceed:',\n    '1. Copy the commands above for each repository',\n    '2. Run them in your local environment',\n    '3. Review and merge the generated PRs',\n    '4. The build system will handle any circular dependencies automatically',\n    '',\n    '**Note:** This is an automated check. If you believe this is incorrect, please review the dependency analysis.'\n  ].join('\\n');\n\n  github.rest.issues.createComment({\n    issue_number: context.issue.number,\n    owner: context.repo.owner,\n    repo: context.repo.repo,\n    body: comment\n  });\n} else {\n  console.log('No dependency rebuilds needed');\n}\n"
+      - name: Fail if dependency rebuilds are needed
+        if: steps.check.outputs.rebuilds_needed == 'true'
+        run: |
+          echo "::error::Dependency rebuilds are required. Please run the generated commands."
+          echo "::error::Check the PR comment or job artifacts for the complete rebuild commands."
+          exit 1
+      - name: Upload dependency commands as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-rebuild-commands
+          path: dependency-commands.txt
+          retention-days: 30
